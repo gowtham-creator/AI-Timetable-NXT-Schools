@@ -1,0 +1,29 @@
+diff --git a/config/console.php b/config/console.php
+index 1fa5f64..57f76b2 100644
+--- a/config/console.php
++++ b/config/console.php
+@@ -21,6 +21,9 @@ $config = [
+             ],
+         ],
+         'db' => $db,
++        'ai' => [
++            'class' => 'app\components\ai\AIClient',
++        ],
+     ],
+     'params' => $params,
+     /*
+diff --git a/modules/admin/views/partials/nav.php b/modules/admin/views/partials/nav.php
+index 84e2bc8..22cd9e4 100644
+--- a/modules/admin/views/partials/nav.php
++++ b/modules/admin/views/partials/nav.php
+@@ -156,6 +156,10 @@ $searchJson = '[ {
+           {
+             "name": "Subjects Time Table",
+             "url": "' . $baseUrl . '/subject-timetable"
++          },
++          {
++            "name": "AI Timetable Studio",
++            "url": "' . $baseUrl . '/timetable-composer"
+           }
+         ]
+       },
