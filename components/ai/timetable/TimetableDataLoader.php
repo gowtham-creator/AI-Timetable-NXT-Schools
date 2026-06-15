@@ -183,6 +183,79 @@ class TimetableDataLoader
     }
 
     /**
+     * WHOLE-SCHOOL load: every active class of the campus as one flat section
+     * list, each section carrying its OWN per-class subjects + teacher pools,
+     * so the solver can run all classes together and prevent cross-class
+     * teacher double-booking (the coordinator's "Kishore can't be in 6A and 7A
+     * at once" requirement). Teachers are one campus-wide pool.
+     *
+     * Reuses load() per class (each class scopes its own subject group), then
+     * merges. A class that can't be loaded (no sections/subjects) is skipped
+     * with a warning rather than failing the whole school.
+     *
+     * @return array{input:array,maps:array,warnings:array}
+     */
+    public function loadSchool(int $campusId, int $academicYearId, array $opts = []): array
+    {
+        $classes = (new Query())
+            ->select(['id', 'title'])
+            ->from('student_class')
+            ->where(['campus_id' => $campusId, 'status' => 1])
+            ->orderBy(['id' => SORT_ASC])
+            ->all();
+        if ($classes === []) {
+            throw new \RuntimeException('No active classes found for this campus.');
+        }
+
+        $allSections = [];
+        $teacherMap  = [];
+        $warnings    = [];
+        $maps        = ['section_names' => [], 'subject_names' => [], 'teacher_names' => []];
+        $teachers    = null;
+        $layout      = SolverFixtures::defaultLayout();
+        $days        = SolverFixtures::defaultDays();
+
+        foreach ($classes as $cls) {
+            try {
+                $one = $this->load($campusId, (int)$cls['id'], $academicYearId);
+            } catch (\Throwable $e) {
+                $warnings[] = 'Class ' . $cls['title'] . ' skipped: ' . $e->getMessage();
+                continue;
+            }
+            $teachers = $one['input']['teachers']; // campus-wide, identical each class
+            $maps['teacher_names'] = $one['maps']['teacher_names'];
+            $classTitle = (string)$cls['title'];
+
+            foreach ($one['input']['sections'] as $sec) {
+                $sec['class']    = $classTitle;
+                $sec['name']     = $classTitle . $sec['name'];           // "6" + "A" → "6A"
+                $sec['subjects'] = $one['input']['subjects'];            // per-class allocation
+                $allSections[]   = $sec;
+                $maps['section_names'][$sec['id']] = $sec['name'];
+            }
+            foreach (($one['input']['teacher_map'] ?? []) as $secId => $bySub) {
+                $teacherMap[$secId] = $bySub;                            // section ids globally unique
+            }
+            $maps['subject_names'] += $one['maps']['subject_names'];
+            $warnings = array_merge($warnings, $one['warnings']);
+        }
+
+        if ($allSections === []) {
+            throw new \RuntimeException('No class could be loaded. ' . implode(' ', $warnings));
+        }
+
+        $input = [
+            'days'        => $days,
+            'layout'      => $layout,
+            'sections'    => $allSections,
+            'subjects'    => $allSections[0]['subjects'], // fallback only; every section overrides
+            'teachers'    => $teachers,
+            'teacher_map' => $teacherMap,
+        ];
+        return ['input' => $input, 'maps' => $maps, 'warnings' => $warnings];
+    }
+
+    /**
      * Overlay a constraints array (from ConstraintIntake or saved JSON) onto
      * solver input. Unknown keys are ignored; matching is by id or
      * case-insensitive name substring.

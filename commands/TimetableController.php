@@ -27,9 +27,10 @@ class TimetableController extends Controller
     public function options($actionID)
     {
         return array_merge(parent::options($actionID), match ($actionID) {
-            'generate' => ['campus', 'class', 'year', 'sections', 'rules'],
-            'publish'  => ['run'],
-            default    => [],
+            'generate'        => ['campus', 'class', 'year', 'sections', 'rules'],
+            'generate-school' => ['campus', 'year', 'rules'],
+            'publish'         => ['run'],
+            default           => [],
         });
     }
 
@@ -190,6 +191,33 @@ class TimetableController extends Controller
         $this->stdout("Run #{$run['run_id']} status={$run['status']} "
             . "placed={$run['stats']['placed']}/{$run['stats']['required']} "
             . "clashes={$run['stats']['clashes']}\n");
+        if (!empty($run['narrative'])) {
+            $this->stdout("\n" . $run['narrative'] . "\n");
+        }
+        return $run['status'] === 'failed' ? ExitCode::UNSPECIFIED_ERROR : ExitCode::OK;
+    }
+
+    /**
+     * Generate a WHOLE-SCHOOL draft (all classes/sections in one run) so a
+     * teacher is never double-booked across classes.
+     *   php yii timetable/generate-school --campus=1 --year=3 [--rules="..."]
+     */
+    public function actionGenerateSchool(): int
+    {
+        if (!$this->campus || !$this->year) {
+            $this->stderr("Required: --campus=ID --year=ACADEMIC_YEAR_ID [--rules=\"...\"]\n");
+            return ExitCode::USAGE;
+        }
+        /** @var \app\components\ai\TimetableComposer $composer */
+        $composer = \Yii::createObject(\app\components\ai\TimetableComposer::class);
+        $run = $composer->generateSchool((int)$this->campus, (int)$this->year, (string)$this->rules, null);
+
+        $this->stdout("Whole-school run #{$run['run_id']} status={$run['status']} "
+            . "placed={$run['stats']['placed']}/{$run['stats']['required']} "
+            . "clashes={$run['stats']['clashes']}\n");
+        foreach (($run['warnings'] ?? []) as $w) {
+            $this->stdout("  ! {$w}\n");
+        }
         if (!empty($run['narrative'])) {
             $this->stdout("\n" . $run['narrative'] . "\n");
         }

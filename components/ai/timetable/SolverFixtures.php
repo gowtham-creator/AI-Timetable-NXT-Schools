@@ -232,4 +232,107 @@ class SolverFixtures
             'teachers' => $teachers,
         ];
     }
+
+    /**
+     * WHOLE-SCHOOL fixture: classes 6–10, two sections each (10 class-sections),
+     * solved in ONE run so cross-class teacher conflicts are prevented.
+     *
+     * Heterogeneous by stream:
+     *   middle (6–8): integrated Science
+     *   high   (9–10): Physics / Chemistry / Biology split
+     * Shared teacher pools across classes (e.g. Mr. Kishore teaches Maths for
+     * every class) — the solver gives each section a consistent owner, balances
+     * load, and never double-books a teacher across classes.
+     */
+    public static function wholeSchoolInput(): array
+    {
+        // School-wide teacher roster (id => name). Pools referenced by subjects.
+        $T = static fn(int $id, string $name) => [
+            'id' => $id, 'name' => $name, 'morning_only' => false,
+            'max_per_day' => 8, 'max_per_week' => 44, 'unavailable' => [],
+        ];
+        $teachers = [
+            $T(1, 'Mr. Kishore'), $T(2, 'Ms. Vanaja'), $T(3, 'Mr. Rao'),          // Maths
+            $T(4, 'Mr. Anthony'), $T(5, 'Ms. Surekha'), $T(6, 'Mr. Iqbal'),       // English
+            $T(7, 'Dr. Menon'), $T(8, 'Ms. Kalyani'),                             // Science (middle)
+            $T(9, 'Mr. Bose'), $T(10, 'Ms. Curie'), $T(11, 'Mr. Darwin'),         // Phy / Chem / Bio (high)
+            $T(12, 'Mrs. Reddy'), $T(13, 'Mr. Naidu'),                            // Social
+            $T(14, 'Ms. Rajitha'), $T(15, 'Ms. Santhoshi'),                       // Telugu
+            $T(16, 'Mrs. Sridevi'), $T(17, 'Ms. Mallishwari'),                    // Hindi
+            $T(18, 'Mr. Joseph'),                                                 // Computer
+            $T(19, 'Mr. Babu'), $T(22, 'Mr. Khan'),                               // PE (2 — afternoon capacity)
+            $T(20, 'Mrs. Rama'),                                                  // Library
+            $T(21, 'Ms. Sharma'),                                                 // Art
+        ];
+
+        $sub = static fn(int $id, string $name, int $pw, int $mpd, bool $pm, array $tids) =>
+            ['id' => $id, 'sgs_id' => 100 + $id, 'name' => $name, 'per_week' => $pw,
+             'max_per_day' => $mpd, 'after_lunch_only' => $pm, 'teacher_ids' => $tids];
+
+        // Middle stream (classes 6–8): 42/wk of 48 slots.
+        $middle = [
+            $sub(1, 'Mathematics', 7, 2, false, [1, 2, 3]),
+            $sub(2, 'English',     7, 2, false, [4, 5, 6]),
+            $sub(3, 'Science',     7, 2, false, [7, 8]),
+            $sub(4, 'Social',      5, 1, false, [12, 13]),
+            $sub(5, 'Telugu',      5, 1, false, [14, 15]),
+            $sub(6, 'Hindi',       5, 1, false, [16, 17]),
+            $sub(7, 'Computer',    2, 1, false, [18]),
+            $sub(8, 'PE',          2, 1, true,  [19, 22]),
+            $sub(9, 'Library',     1, 1, false, [20]),
+            $sub(10, 'Art',        1, 1, false, [21]),
+        ];
+        // High stream (classes 9–10): 44/wk of 48 slots; split sciences.
+        $high = [
+            $sub(1, 'Mathematics', 7, 2, false, [1, 2, 3]),
+            $sub(2, 'English',     6, 2, false, [4, 5, 6]),
+            $sub(11, 'Physics',    5, 2, false, [9]),
+            $sub(12, 'Chemistry',  5, 2, false, [10]),
+            $sub(13, 'Biology',    4, 1, false, [11]),
+            $sub(4, 'Social',      5, 1, false, [12, 13]),
+            $sub(5, 'Telugu',      4, 1, false, [14, 15]),
+            $sub(6, 'Hindi',       4, 1, false, [16, 17]),
+            $sub(7, 'Computer',    2, 1, false, [18]),
+            $sub(8, 'PE',          2, 1, true,  [19, 22]),
+        ];
+
+        $sections = [];
+        foreach (['6', '7', '8', '9', '10'] as $cls) {
+            $isHigh = (int)$cls >= 9;
+            foreach (['A', 'B'] as $sx) {
+                $sections[] = [
+                    'id'       => (int)($cls . ($sx === 'A' ? '01' : '02')),
+                    'name'     => $cls . $sx,
+                    'class'    => $cls,
+                    'subjects' => $isHigh ? $high : $middle,   // per-class subject + teacher allocation
+                ];
+            }
+        }
+
+        return [
+            'days'     => [1, 2, 3, 4, 5, 6],
+            'layout'   => self::wholeSchoolLayout(),
+            'sections' => $sections,
+            'subjects' => $middle, // default fallback (unused — every section overrides)
+            'teachers' => $teachers,
+        ];
+    }
+
+    /** 8 academic periods, lunch after P5 (afternoon = P6–P8). */
+    private static function wholeSchoolLayout(): array
+    {
+        return [
+            ['kind' => 'assembly', 'label' => 'Assembly',   'time_from' => '08:30', 'time_to' => '08:45'],
+            ['kind' => 'period', 'no' => 1, 'time_from' => '08:45', 'time_to' => '09:30'],
+            ['kind' => 'period', 'no' => 2, 'time_from' => '09:30', 'time_to' => '10:15'],
+            ['kind' => 'period', 'no' => 3, 'time_from' => '10:15', 'time_to' => '11:00'],
+            ['kind' => 'break', 'label' => 'Snack', 'time_from' => '11:00', 'time_to' => '11:15'],
+            ['kind' => 'period', 'no' => 4, 'time_from' => '11:15', 'time_to' => '12:00'],
+            ['kind' => 'period', 'no' => 5, 'time_from' => '12:00', 'time_to' => '12:45'],
+            ['kind' => 'lunch', 'label' => 'Lunch', 'time_from' => '12:45', 'time_to' => '13:25'],
+            ['kind' => 'period', 'no' => 6, 'time_from' => '13:25', 'time_to' => '14:10'],
+            ['kind' => 'period', 'no' => 7, 'time_from' => '14:10', 'time_to' => '14:55'],
+            ['kind' => 'period', 'no' => 8, 'time_from' => '14:55', 'time_to' => '15:40'],
+        ];
+    }
 }

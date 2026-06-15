@@ -40,11 +40,32 @@ class TimetableComposer extends Component
     {
         $loader = new TimetableDataLoader();
         $loaded = $loader->load($campusId, $classId, $academicYearId, $sectionIds);
+        return $this->runPipeline($campusId, $classId, $academicYearId, $rulesText, $loaded, $userId);
+    }
 
-        $context = [
-            'user_id'   => $userId,
-            'campus_id' => $campusId,
-        ];
+    /**
+     * Whole-school generation: EVERY class of the campus solved in ONE run, so a
+     * teacher who teaches across classes (e.g. Mr. Kishore — Maths for 6–10) is
+     * never double-booked, and an alternative teacher is assigned automatically.
+     * The run's class_id is stored as 0 (whole-school sentinel); publish() writes
+     * each row to its own class via the section→class lookup.
+     */
+    public function generateSchool(int $campusId, int $academicYearId, string $rulesText, ?int $userId): array
+    {
+        $loader = new TimetableDataLoader();
+        $loaded = $loader->loadSchool($campusId, $academicYearId);
+        return $this->runPipeline($campusId, 0, $academicYearId, $rulesText, $loaded, $userId);
+    }
+
+    /**
+     * Shared pipeline: intake → constraints → feasibility → solve (with a
+     * clean-slate retry) → persist draft → narrate. Used by both single-class
+     * generate() and whole-school generateSchool().
+     */
+    private function runPipeline(int $campusId, int $classId, int $academicYearId, string $rulesText, array $loaded, ?int $userId): array
+    {
+        $loader = new TimetableDataLoader();
+        $context = ['user_id' => $userId, 'campus_id' => $campusId];
 
         $intake      = new ConstraintIntake();
         $constraints = $intake->parse($rulesText, $loaded['maps'], $context);
@@ -179,15 +200,22 @@ class TimetableComposer extends Component
         $roomId     = $this->resolveRoomId($run->campus_id, $run->class_id, $sectionIds);
         $now        = date('Y-m-d H:i:s');
 
+        // Resolve class per section so each row is written to its own class —
+        // correct for a single class AND a whole-school run (class_id sentinel 0).
+        // section_id uniquely determines its class, so we archive/insert by
+        // section regardless of the run's class_id.
+        $sectionClass = (new Query())->select(['student_class_id'])
+            ->from('class_sections')->where(['id' => $sectionIds])->indexBy('id')->column();
+
         $tx = Yii::$app->db->beginTransaction();
         try {
-            // Archive (soft-delete) the current timetable for this scope.
+            // Archive (soft-delete) the current timetable for exactly these
+            // sections (campus + year scoped; section_id encodes the class).
             $archived = Yii::$app->db->createCommand()->update(
                 'subject_timetable',
                 ['status' => SubjectTimetable::STATUS_DELETE, 'updated_on' => $now, 'update_user_id' => $userId],
                 [
                     'campus_id'        => $run->campus_id,
-                    'class_id'         => $run->class_id,
                     'academic_year_id' => $run->academic_year_id,
                     'section_id'       => $sectionIds,
                     'status'           => SubjectTimetable::STATUS_ACTIVE,
@@ -204,11 +232,13 @@ class TimetableComposer extends Component
             $dayFormat = \app\components\ai\timetable\DayId::detectFormat($run->campus_id);
             $rows = [];
             foreach ($slots as $s) {
+                $secId = (int)$s['section_id'];
+                $rowClassId = (int)($sectionClass[$secId] ?? $run->class_id); // per-section class
                 $rows[] = [
                     $run->campus_id,
                     \app\components\ai\timetable\DayId::forCampus((int)$s['day_id'], $dayFormat),
-                    $run->class_id,
-                    (int)$s['section_id'],
+                    $rowClassId,
+                    $secId,
                     $s['subject_group_subject_id'] !== null ? (int)$s['subject_group_subject_id'] : 0,
                     (int)$s['subject_id'],
                     (int)$s['teacher_details_id'],

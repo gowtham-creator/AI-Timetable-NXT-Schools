@@ -36,13 +36,23 @@ namespace app\components\ai\timetable;
  *   'layout'      => [ ['kind'=>'assembly','label'=>..,'time_from'=>'08:00','time_to'=>'08:20'],
  *                      ['kind'=>'period','no'=>1,'time_from'=>..,'time_to'=>..], ...,
  *                      ['kind'=>'break'|'lunch'|'activity', ...] ],
- *   'sections'    => [ ['id'=>12,'name'=>'A'], ... ],
+ *   'sections'    => [ ['id'=>12,'name'=>'6A','class'=>'6'], ... ],
  *   'subjects'    => [ ['id'=>5,'sgs_id'=>77,'name'=>'Mathematics','per_week'=>10,
  *                       'max_per_day'=>2,'after_lunch_only'=>false,'teacher_ids'=>[3,9]], ... ],
  *   'teachers'    => [ ['id'=>3,'name'=>'..','morning_only'=>false,'max_per_day'=>8,
  *                       'max_per_week'=>44,'unavailable'=>[['day'=>5,'period'=>2]]], ... ],
  *   'teacher_map' => [ 12 => [5 => 3] ],       // optional: section 12, subject 5 → teacher 3
  * ]
+ *
+ * WHOLE-SCHOOL / CROSS-CLASS: pass every class-section as one flat 'sections'
+ * list and solve once. Each section may override the global 'subjects' with its
+ * own per-class list (incl. that class's teacher pools) via section['subjects'].
+ * Because 'teachers' is a single school-wide pool and teacher availability is
+ * tracked globally per (day,period), a teacher placed in 6A-P1 can NEVER be
+ * placed in 7A-P1 — the solver assigns an alternative teacher (or another slot)
+ * automatically. Teacher consistency locks ONE teacher per (section,subject),
+ * so a teacher may own a subject across several sections but is never
+ * double-booked at the same time.
  */
 class TimetableSolver
 {
@@ -168,9 +178,16 @@ class TimetableSolver
         }
 
         // Demand: one work item per required period, hardest-first.
+        // Each section may carry its OWN subjects[] (heterogeneous classes —
+        // e.g. class 6 integrated Science vs class 9 Physics/Chem/Bio, with
+        // per-class teacher pools); otherwise it uses the global $subjects.
+        // Teachers are a single school-wide pool, so a teacher booked in one
+        // class-section can never be placed in another at the same time.
         $items = [];
         foreach ($sections as $sec) {
-            foreach ($subjects as $sub) {
+            $secSubjects = (isset($sec['subjects']) && is_array($sec['subjects']) && $sec['subjects'] !== [])
+                ? $sec['subjects'] : $subjects;
+            foreach ($secSubjects as $sub) {
                 for ($i = 0; $i < (int)$sub['per_week']; $i++) {
                     $items[] = ['sec' => $sec, 'sub' => $sub];
                 }
