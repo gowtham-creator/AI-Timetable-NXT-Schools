@@ -14,6 +14,7 @@ $this->params['breadcrumbs'][] = $this->title;
 
 $generateUrl    = Url::to(['generate']);
 $sectionsUrl    = Url::to(['sections']);
+$allocationUrl  = Url::to(['allocation']);
 $runUrl         = Url::to(['run']);
 $publishUrl     = Url::to(['publish']);
 $discardUrl     = Url::to(['discard']);
@@ -38,6 +39,11 @@ $csrf           = Yii::$app->request->getCsrfToken();
     .ttc-reason{color:#777;font-size:12px}
     #ttc-grid-wrap{overflow-x:auto}
     .ttc-spin{display:none;color:#1E4FB8;font-weight:600}
+    .ttc-alloc-sec{border:1px solid #e3e8ef;border-radius:6px;padding:10px 14px;margin-bottom:10px}
+    .ttc-alloc-sec h4{margin:0 0 8px;font-size:14px}
+    .ttc-alloc-table{width:100%;font-size:12.5px;border-collapse:collapse}
+    .ttc-alloc-table th,.ttc-alloc-table td{border-bottom:1px solid #eef1f5;padding:5px 8px;text-align:left;vertical-align:top}
+    .ttc-alloc-table th{color:#64708a;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
 </style>
 
 <div class="ttc-card">
@@ -67,6 +73,14 @@ $csrf           = Yii::$app->request->getCsrfToken();
             <label><?= Yii::t('app', 'Sections (default: all)') ?></label>
             <select id="ttc-sections" class="form-control" multiple size="3"></select>
         </div>
+    </div>
+
+    <div id="ttc-allocation-card" style="display:none;margin-top:14px">
+        <label><?= Yii::t('app', 'Teachers & the subject(s) they teach') ?>
+            <small style="color:#888;font-weight:400"> — confirm the allocation, then generate. A teacher may teach more than one subject.</small>
+        </label>
+        <div id="ttc-allocation-warn" class="ttc-chips"></div>
+        <div id="ttc-allocation-body"></div>
     </div>
 
     <div class="row" style="margin-top:12px">
@@ -152,6 +166,7 @@ $js = <<<JS
 (function(){
     var runId = null;
     var csrf = '{$csrf}';
+    var allocationUrl = '{$allocationUrl}';
 
     function chips(stats, source, warnings) {
         var h = '';
@@ -169,16 +184,51 @@ $js = <<<JS
         $.get('{$runUrl}', {id: id}, function(html){ $('#ttc-grid-wrap').html(html); });
     }
 
+    // Intake step: show each section's teachers and the subject(s) each teaches.
+    function renderAllocation(res){
+        if (!res || res.ok === false) { $('#ttc-allocation-card').hide(); return; }
+        var warn = '';
+        (res.warnings || []).forEach(function(w){ warn += '<span class="ttc-chip warn">' + w + '</span>'; });
+        if (res.has_sections === false) { warn += '<span class="ttc-chip">No sections — whole class as one timetable</span>'; }
+        $('#ttc-allocation-warn').html(warn);
+        var h = '';
+        (res.sections || []).forEach(function(sec){
+            h += '<div class="ttc-alloc-sec"><h4>' + (sec.synthetic ? 'Whole class' : ('Section ' + sec.name)) + '</h4>';
+            if (!(sec.teachers || []).length) { h += '<div class="ttc-reason">No teachers resolved yet.</div></div>'; return; }
+            h += '<table class="ttc-alloc-table"><thead><tr><th>Teacher</th><th>Subject(s) taught</th></tr></thead><tbody>';
+            sec.teachers.forEach(function(t){
+                var subs = (t.subjects || []).map(function(s){ return s.name; }).join(', ');
+                h += '<tr><td>' + t.name + '</td><td>' + subs + '</td></tr>';
+            });
+            h += '</tbody></table></div>';
+        });
+        $('#ttc-allocation-body').html(h);
+        $('#ttc-allocation-card').show();
+    }
+
+    function loadAllocation(){
+        var cid = $('#ttc-class').val();
+        if (!cid) { $('#ttc-allocation-card').hide(); return; }
+        var secs = $('#ttc-sections').val() || [];
+        $('#ttc-allocation-body').html('<i class="fa fa-spinner fa-spin"></i>');
+        $('#ttc-allocation-card').show();
+        $.get(allocationUrl, {class_id: cid, section_ids: secs.join(','), academic_year_id: $('#ttc-year').val()},
+            renderAllocation, 'json').fail(function(){ $('#ttc-allocation-card').hide(); });
+    }
+
     $('#ttc-class').on('change', function(){
         var cid = $(this).val();
         $('#ttc-sections').empty();
-        if (!cid) return;
+        if (!cid) { $('#ttc-allocation-card').hide(); return; }
         $.get('{$sectionsUrl}', {class_id: cid}, function(res){
             (res.sections || []).forEach(function(s){
                 $('#ttc-sections').append($('<option>').val(s.id).text('Section ' + s.section_name).prop('selected', true));
             });
+            loadAllocation();
         });
     });
+    $('#ttc-sections').on('change', loadAllocation);
+    $('#ttc-year').on('change', loadAllocation);
 
     $('#ttc-generate').on('click', function(){
         var cid = $('#ttc-class').val();
@@ -195,6 +245,11 @@ $js = <<<JS
             if (!res.ok && !res.run_id) { alert(res.message || 'Generation failed'); return; }
             runId = res.run_id;
             $('#ttc-stats').html(chips(res.stats, res.source, res.warnings));
+            if (res.distinct_sections === false) {
+                $('#ttc-stats').append('<span class="ttc-chip warn">two sections came out identical — regenerate</span>');
+            } else {
+                $('#ttc-stats').append('<span class="ttc-chip">all sections distinct · no teacher double-booked</span>');
+            }
             $('#ttc-narrative').text(res.narrative || '');
             $('#ttc-result').show();
             $('#ttc-publish').prop('disabled', !res.ok);

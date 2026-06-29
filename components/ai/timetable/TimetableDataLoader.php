@@ -31,7 +31,7 @@ class TimetableDataLoader
     {
         $warnings = [];
 
-        // ── Sections ────────────────────────────────────────────────────────
+        // ── Sections (dynamic; a small school may have none) ─────────────────
         $sectionQuery = (new Query())
             ->select(['id', 'section_name'])
             ->from('class_sections')
@@ -43,98 +43,167 @@ class TimetableDataLoader
 
         $sections = [];
         foreach ($sectionRows as $r) {
-            $sections[] = ['id' => (int)$r['id'], 'name' => (string)$r['section_name']];
+            $sections[] = ['id' => (int)$r['id'], 'name' => (string)$r['section_name'], 'synthetic' => false];
         }
         if ($sections === []) {
-            throw new \RuntimeException('No active sections found for this class — create sections first.');
+            // Small school: this class has no sections — treat the WHOLE CLASS as
+            // one timetable unit. A negative sentinel id keeps it distinct from any
+            // real class_sections row; publish() falls back to run->class_id.
+            $warnings[] = 'No sections defined for this class — treating the whole class as one timetable unit.';
+            $sections   = [['id' => -$classId, 'name' => '(Whole class)', 'synthetic' => true]];
+            $secIdList  = [];
+        } else {
+            $secIdList = array_column($sections, 'id');
         }
 
-        // ── Subjects via the class's subject group(s) ───────────────────────
-        $secIdList = array_column($sections, 'id');
-        $sgsRows = (new Query())
-            ->select(['sgs.id AS sgs_id', 's.id AS subject_id', 's.subject_name'])
-            ->from(['sgcs' => 'subject_groups_class_sections'])
-            ->innerJoin(['sg' => 'subject_groups'], 'sg.id = sgcs.subject_group_id')
-            ->innerJoin(['sgs' => 'subject_group_subjects'], 'sgs.subject_group_id = sg.id')
-            ->innerJoin(['s' => 'subjects'], 's.id = sgs.subject_id')
-            ->where(['sgcs.class_sections_id' => $secIdList])
-            ->andWhere(['sgcs.status' => 1, 'sg.status' => 1, 'sgs.status' => 1, 's.status' => 1])
-            ->groupBy(['s.id'])
-            ->all();
-
-        if ($sgsRows === []) {
-            // Fallback: every active subject on the campus (flagged for the admin).
-            $warnings[] = 'No subject group is linked to these sections — using all campus subjects. '
-                . 'Link a subject group for tighter results.';
-            $sgsRows = (new Query())
-                ->select(['s.id AS subject_id', 's.subject_name', 'NULL AS sgs_id'])
-                ->from(['s' => 'subjects'])
-                ->where(['s.campus_id' => $campusId, 's.status' => 1])
+        // ── Subjects per section (different sections may use different groups) ─
+        $rawBySection = []; // secId => [ subjectId => ['subject_id','sgs_id','subject_name'] ]
+        if ($secIdList !== []) {
+            $rows = (new Query())
+                ->select(['cs' => 'sgcs.class_sections_id', 'sgs_id' => 'sgs.id',
+                    'subject_id' => 's.id', 's.subject_name'])
+                ->from(['sgcs' => 'subject_groups_class_sections'])
+                ->innerJoin(['sg' => 'subject_groups'], 'sg.id = sgcs.subject_group_id')
+                ->innerJoin(['sgs' => 'subject_group_subjects'], 'sgs.subject_group_id = sg.id')
+                ->innerJoin(['s' => 'subjects'], 's.id = sgs.subject_id')
+                ->where(['sgcs.class_sections_id' => $secIdList])
+                ->andWhere(['sgcs.status' => 1, 'sg.status' => 1, 'sgs.status' => 1, 's.status' => 1])
                 ->all();
-        }
-        if ($sgsRows === []) {
-            throw new \RuntimeException('No active subjects found for this campus — create subjects first.');
+            foreach ($rows as $r) {
+                $rawBySection[(int)$r['cs']][(int)$r['subject_id']] = [
+                    'subject_id'   => (int)$r['subject_id'],
+                    'sgs_id'       => $r['sgs_id'] !== null ? (int)$r['sgs_id'] : null,
+                    'subject_name' => (string)$r['subject_name'],
+                ];
+            }
         }
 
-        // ── Teacher pool + competence from timetable history ────────────────
-        $teacherRows = (new Query())
-            ->select(['id', 'name'])
-            ->from('teacher_details')
-            ->where(['campus_id' => $campusId])
-            ->all();
+        // Campus-wide fallback subject list (synthetic class, or a section with no
+        // subject-group linkage). Lazily loaded once.
+        $campusSubjects   = null;
+        $campusSubjectList = function () use (&$campusSubjects, $campusId): array {
+            if ($campusSubjects === null) {
+                $campusSubjects = [];
+                foreach ((new Query())->select(['subject_id' => 's.id', 's.subject_name'])
+                             ->from(['s' => 'subjects'])
+                             ->where(['s.campus_id' => $campusId, 's.status' => 1])->all() as $r) {
+                    $campusSubjects[(int)$r['subject_id']] = [
+                        'subject_id'   => (int)$r['subject_id'],
+                        'sgs_id'       => null,
+                        'subject_name' => (string)$r['subject_name'],
+                    ];
+                }
+            }
+            return $campusSubjects;
+        };
+
+        // ── Teacher pool + competence/dominant from timetable history ────────
+        $teacherRows = (new Query())->select(['id', 'name'])->from('teacher_details')
+            ->where(['campus_id' => $campusId])->all();
         if ($teacherRows === []) {
             throw new \RuntimeException('No teachers found for this campus — add teacher profiles first.');
         }
-
         $allTeacherIds = array_map(static fn($t) => (int)$t['id'], $teacherRows);
+        $teacherIdSet  = array_flip($allTeacherIds);
 
-        // Who has taught which subject on this campus (any class, current data)?
-        // Counts let us also derive the dominant teacher per (section, subject)
-        // — the "teacher-wise workload sheet" the school maintains on paper.
         $historyRows = [];
         try {
-            $historyRows = (new Query())
+            $q = (new Query())
                 ->select(['subject_id', 'teacher_details_id', 'section_id', 'cnt' => 'COUNT(*)'])
                 ->from('subject_timetable')
                 ->where(['campus_id' => $campusId, 'status' => 1])
-                ->andWhere(['not', ['subject_id' => null]])
-                ->groupBy(['subject_id', 'teacher_details_id', 'section_id'])
-                ->all();
+                ->andWhere(['not', ['subject_id' => null]]);
+            if ($academicYearId > 0) {
+                // Scope competence + last-owner seed to the selected year's actual
+                // schedule. Legacy rows with no year fall through to the pool fallback.
+                $q->andWhere(['academic_year_id' => $academicYearId]);
+            }
+            $historyRows = $q->groupBy(['subject_id', 'teacher_details_id', 'section_id'])->all();
         } catch (\Throwable $e) {
             $warnings[] = 'Could not read teaching history (' . $e->getMessage() . ') — pooling all teachers per subject.';
         }
-        $competence = [];
-        $dominant   = []; // [sectionId][subjectId] => ['tid' =>, 'cnt' =>]
+        $competence      = []; // [subjectId]        => tid[]  (campus-wide)
+        $competenceBySec = []; // [secId][subjectId] => tid[]  (this section only)
+        $dominant        = []; // [secId][subjectId] => ['tid','cnt']  (last term's owner)
         foreach ($historyRows as $h) {
-            $sid = (int)$h['subject_id'];
-            $tid = (int)$h['teacher_details_id'];
-            $competence[$sid][] = $tid;
+            $sid   = (int)$h['subject_id'];
+            $tid   = (int)$h['teacher_details_id'];
             $secId = (int)$h['section_id'];
             $cnt   = (int)$h['cnt'];
+            $competence[$sid][] = $tid;
+            $competenceBySec[$secId][$sid][] = $tid;
             if (!isset($dominant[$secId][$sid]) || $cnt > $dominant[$secId][$sid]['cnt']) {
                 $dominant[$secId][$sid] = ['tid' => $tid, 'cnt' => $cnt];
             }
         }
 
-        $subjects = [];
-        foreach ($sgsRows as $r) {
-            $sid     = (int)$r['subject_id'];
-            $name    = (string)$r['subject_name'];
-            $profile = SolverFixtures::profileSubject($name);
-            $tids    = array_values(array_unique(array_intersect($competence[$sid] ?? [], $allTeacherIds)));
-            if ($tids === []) {
-                $tids = $allTeacherIds; // no history yet → whole pool, solver balances load
+        // Viable teacher pool for a (section, subject): prefer this section's
+        // history, then campus-wide history, then the whole pool (the solver
+        // balances load and guarantees no double-booking).
+        $poolFor = function (int $secId, int $sid) use ($competenceBySec, $competence, $allTeacherIds): array {
+            $bySec = array_values(array_unique(array_intersect($competenceBySec[$secId][$sid] ?? [], $allTeacherIds)));
+            if ($bySec !== []) {
+                return $bySec;
             }
-            $subjects[] = [
-                'id'               => $sid,
-                'sgs_id'           => isset($r['sgs_id']) && $r['sgs_id'] !== null ? (int)$r['sgs_id'] : null,
-                'name'             => $name,
-                'per_week'         => $profile['per_week'],
-                'max_per_day'      => $profile['max_per_day'],
-                'after_lunch_only' => $profile['after_lunch_only'],
-                'teacher_ids'      => $tids,
-            ];
+            $campus = array_values(array_unique(array_intersect($competence[$sid] ?? [], $allTeacherIds)));
+            return $campus !== [] ? $campus : $allTeacherIds;
+        };
+
+        // ── Build each section's subject list + a deduped top-level union ─────
+        $unionSubjects = [];
+        foreach ($sections as &$section) {
+            $secId   = (int)$section['id'];
+            $rawList = $rawBySection[$secId] ?? [];
+            if ($rawList === []) {
+                $rawList = $campusSubjectList(); // synthetic class / no group linkage
+            }
+            $secSubjects = [];
+            foreach ($rawList as $raw) {
+                $sid     = (int)$raw['subject_id'];
+                $name    = (string)$raw['subject_name'];
+                $profile = SolverFixtures::profileSubject($name);
+                $secSubjects[] = [
+                    'id'               => $sid,
+                    'sgs_id'           => $raw['sgs_id'],
+                    'name'             => $name,
+                    'per_week'         => $profile['per_week'],
+                    'max_per_day'      => $profile['max_per_day'],
+                    'after_lunch_only' => $profile['after_lunch_only'],
+                    'teacher_ids'      => $poolFor($secId, $sid),
+                ];
+                if (!isset($unionSubjects[$sid])) {
+                    $pool = array_values(array_unique(array_intersect($competence[$sid] ?? [], $allTeacherIds)));
+                    $unionSubjects[$sid] = [
+                        'id'               => $sid,
+                        'sgs_id'           => $raw['sgs_id'],
+                        'name'             => $name,
+                        'per_week'         => $profile['per_week'],
+                        'max_per_day'      => $profile['max_per_day'],
+                        'after_lunch_only' => $profile['after_lunch_only'],
+                        'teacher_ids'      => $pool !== [] ? $pool : $allTeacherIds,
+                    ];
+                }
+            }
+            $section['subjects'] = $secSubjects;
         }
+        unset($section);
+
+        if ($unionSubjects === []) {
+            throw new \RuntimeException('No active subjects found for this campus — create subjects first.');
+        }
+        // Warn once if NO real section had a linked subject group (all fell back).
+        $anyLinked = false;
+        foreach ($secIdList as $sid2) {
+            if (!empty($rawBySection[$sid2])) {
+                $anyLinked = true;
+                break;
+            }
+        }
+        if ($secIdList !== [] && !$anyLinked) {
+            $warnings[] = 'No subject group is linked to these sections — using all campus subjects. '
+                . 'Link a subject group for tighter results.';
+        }
+        $subjects = array_values($unionSubjects);
 
         $teachers = [];
         foreach ($teacherRows as $t) {
@@ -150,14 +219,18 @@ class TimetableDataLoader
             ];
         }
 
-        // Teacher consistency seed: keep last term's (section, subject) owner
-        // when they're still on this campus. The solver locks the rest.
-        $subjectIdsInRun = array_column($subjects, 'id');
-        $teacherIdSet    = array_flip($allTeacherIds);
-        $teacherMap      = [];
-        foreach ($secIdList as $secId) {
-            foreach ($subjectIdsInRun as $sid) {
-                $d = $dominant[$secId][$sid] ?? null;
+        // Teacher consistency seed: keep last term's (section, subject) owner when
+        // they're still on this campus. Real sections only — a synthetic whole-class
+        // unit has no section history, so the solver assigns fresh (correct).
+        $teacherMap = [];
+        foreach ($sections as $section) {
+            $secId = (int)$section['id'];
+            if ($secId < 0) {
+                continue;
+            }
+            foreach ($section['subjects'] as $sub) {
+                $sid = (int)$sub['id'];
+                $d   = $dominant[$secId][$sid] ?? null;
                 if ($d !== null && isset($teacherIdSet[$d['tid']])) {
                     $teacherMap[$secId][$sid] = $d['tid'];
                 }
@@ -180,6 +253,84 @@ class TimetableDataLoader
         ];
 
         return ['input' => $input, 'maps' => $maps, 'warnings' => $warnings];
+    }
+
+    /**
+     * Intake-screen data: Class -> Sections -> Teachers -> Subject(s) each teaches.
+     * Derived FROM load() so the display matches exactly what generate() will solve.
+     * Returns the ALLOCATION shape (DATA CONTRACT 1.6); a teacher can appear with
+     * more than one subject. Display-only — no solve, no writes.
+     *
+     * @return array{ok:bool,class_id:int,has_sections:bool,sections:array,warnings:array}
+     */
+    public function loadClassAllocation(int $campusId, int $classId, int $academicYearId, array $sectionIds = []): array
+    {
+        try {
+            $loaded = $this->load($campusId, $classId, $academicYearId, $sectionIds);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'message' => $e->getMessage(),
+                'class_id' => $classId, 'has_sections' => false, 'sections' => [], 'warnings' => []];
+        }
+
+        $input      = $loaded['input'];
+        $names      = $loaded['maps']['teacher_names'];
+        $teacherMap = $input['teacher_map'] ?? [];
+        $nameOf     = static fn($tid) => $names[(int)$tid] ?? ('#' . (int)$tid);
+
+        $hasSections = true;
+        $outSections = [];
+        foreach ($input['sections'] as $sec) {
+            $secId = (int)$sec['id'];
+            if (!empty($sec['synthetic'])) {
+                $hasSections = false;
+            }
+
+            $subjectsOut = [];
+            $byTeacher   = []; // tid => ['id','name','subjects'=>[sid=>['id','name']]]
+            foreach (($sec['subjects'] ?? []) as $sub) {
+                $sid       = (int)$sub['id'];
+                $ownerTid  = $teacherMap[$secId][$sid] ?? null;
+                $teacherIds = array_map('intval', $sub['teacher_ids'] ?? []);
+
+                $subjectsOut[] = [
+                    'subject_id'    => $sid,
+                    'subject_name'  => $sub['name'],
+                    'teacher_id'    => $ownerTid !== null ? (int)$ownerTid : null,
+                    'teacher_name'  => $ownerTid !== null ? $nameOf($ownerTid) : null,
+                    'teacher_ids'   => $teacherIds,
+                    'teacher_names' => array_map($nameOf, $teacherIds),
+                ];
+
+                // teacher-centric: pinned owner if known, else every viable teacher.
+                foreach (($ownerTid !== null ? [(int)$ownerTid] : $teacherIds) as $tid) {
+                    if (!isset($byTeacher[$tid])) {
+                        $byTeacher[$tid] = ['id' => $tid, 'name' => $nameOf($tid), 'subjects' => []];
+                    }
+                    $byTeacher[$tid]['subjects'][$sid] = ['id' => $sid, 'name' => $sub['name']];
+                }
+            }
+
+            $teachersOut = [];
+            foreach ($byTeacher as $t) {
+                $teachersOut[] = ['id' => $t['id'], 'name' => $t['name'], 'subjects' => array_values($t['subjects'])];
+            }
+
+            $outSections[] = [
+                'id'        => $secId,
+                'name'      => (string)$sec['name'],
+                'synthetic' => !empty($sec['synthetic']),
+                'subjects'  => $subjectsOut,
+                'teachers'  => $teachersOut,
+            ];
+        }
+
+        return [
+            'ok'           => true,
+            'class_id'     => $classId,
+            'has_sections' => $hasSections,
+            'sections'     => $outSections,
+            'warnings'     => $loaded['warnings'],
+        ];
     }
 
     /**
@@ -227,10 +378,14 @@ class TimetableDataLoader
             $classTitle = (string)$cls['title'];
 
             foreach ($one['input']['sections'] as $sec) {
-                $sec['class']    = $classTitle;
-                $sec['name']     = $classTitle . $sec['name'];           // "6" + "A" → "6A"
-                $sec['subjects'] = $one['input']['subjects'];            // per-class allocation
-                $allSections[]   = $sec;
+                $sec['class'] = $classTitle;
+                $sec['name']  = $classTitle . $sec['name'];              // "6" + "A" → "6A"
+                // load() now sets per-section subjects; keep them, fall back to the
+                // class union only if a section somehow has none.
+                if (empty($sec['subjects'])) {
+                    $sec['subjects'] = $one['input']['subjects'];
+                }
+                $allSections[] = $sec;
                 $maps['section_names'][$sec['id']] = $sec['name'];
             }
             foreach (($one['input']['teacher_map'] ?? []) as $secId => $bySub) {
@@ -305,24 +460,23 @@ class TimetableDataLoader
         }
 
         foreach (($constraints['subjects'] ?? []) as $rule) {
+            // Overlay the top-level union...
             foreach ($input['subjects'] as &$sub) {
-                if (!$this->matches($rule, $sub, 'subject_id')) {
-                    continue;
-                }
-                if (isset($rule['per_week'])) {
-                    $sub['per_week'] = max(0, min(15, (int)$rule['per_week']));
-                }
-                if (isset($rule['max_per_day'])) {
-                    $sub['max_per_day'] = max(1, min(4, (int)$rule['max_per_day']));
-                }
-                if (isset($rule['after_lunch_only'])) {
-                    $sub['after_lunch_only'] = (bool)$rule['after_lunch_only'];
-                }
-                if (isset($rule['teacher_ids']) && is_array($rule['teacher_ids']) && $rule['teacher_ids'] !== []) {
-                    $sub['teacher_ids'] = array_map('intval', $rule['teacher_ids']);
+                if ($this->matches($rule, $sub, 'subject_id')) {
+                    $this->applySubjectRule($sub, $rule);
                 }
             }
             unset($sub);
+            // ...and every section's own subject list (per-section overrides take effect).
+            foreach ($input['sections'] as &$section) {
+                foreach (($section['subjects'] ?? []) as &$secSub) {
+                    if ($this->matches($rule, $secSub, 'subject_id')) {
+                        $this->applySubjectRule($secSub, $rule);
+                    }
+                }
+                unset($secSub);
+            }
+            unset($section);
         }
 
         foreach (($constraints['teachers'] ?? []) as $rule) {
@@ -351,6 +505,23 @@ class TimetableDataLoader
         }
 
         return $input;
+    }
+
+    /** Overlay one subject rule onto a subject row (top-level or per-section). */
+    private function applySubjectRule(array &$sub, array $rule): void
+    {
+        if (isset($rule['per_week'])) {
+            $sub['per_week'] = max(0, min(15, (int)$rule['per_week']));
+        }
+        if (isset($rule['max_per_day'])) {
+            $sub['max_per_day'] = max(1, min(4, (int)$rule['max_per_day']));
+        }
+        if (isset($rule['after_lunch_only'])) {
+            $sub['after_lunch_only'] = (bool)$rule['after_lunch_only'];
+        }
+        if (isset($rule['teacher_ids']) && is_array($rule['teacher_ids']) && $rule['teacher_ids'] !== []) {
+            $sub['teacher_ids'] = array_map('intval', $rule['teacher_ids']);
+        }
     }
 
     /** Match a constraint rule to a subject/teacher row by id or name substring. */

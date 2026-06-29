@@ -31,6 +31,8 @@ class TimetableComposerController extends Controller
             'verbs' => [
                 'class' => VerbFilter::className(),
                 'actions' => [
+                    'sections'         => ['get'],
+                    'allocation'       => ['get'],
                     'generate'         => ['post'],
                     'publish'          => ['post'],
                     'discard'          => ['post'],
@@ -43,7 +45,7 @@ class TimetableComposerController extends Controller
                     [
                         'allow' => true,
                         'actions' => [
-                            'index', 'sections', 'generate', 'run',
+                            'index', 'sections', 'allocation', 'generate', 'run',
                             'publish', 'discard', 'substitutes', 'apply-substitute',
                         ],
                         'matchCallback' => function () {
@@ -91,7 +93,37 @@ class TimetableComposerController extends Controller
             ->where(['campus_id' => $this->campusId(), 'student_class_id' => (int)$class_id, 'status' => 1])
             ->orderBy(['section_name' => SORT_ASC])
             ->asArray()->all();
-        return ['sections' => $rows];
+        if ($rows === []) {
+            // Small school: this class has no sections — offer a single whole-class unit.
+            return ['sections' => [['id' => -(int)$class_id, 'section_name' => 'Whole class (no sections)']],
+                    'synthetic' => true];
+        }
+        return ['sections' => $rows, 'synthetic' => false];
+    }
+
+    /**
+     * Teachers + the subject(s) each teaches, for a class's section(s) (AJAX GET).
+     * Drives the intake step: Class -> Sections -> Teachers/Subjects -> Generate.
+     */
+    public function actionAllocation($class_id, $section_ids = '')
+    {
+        Yii::$app->response->format = Response::FORMAT_JSON;
+        $classId = (int)$class_id;
+        // Campus ownership — works for no-section classes too (validates the class,
+        // not class_sections, which a small school may not have).
+        if (!StudentClass::find()->where(['id' => $classId, 'campus_id' => $this->campusId(), 'status' => 1])->exists()) {
+            return ['ok' => false, 'message' => 'Class not found.', 'sections' => []];
+        }
+        $raw     = is_array($section_ids) ? $section_ids : array_filter(explode(',', (string)$section_ids));
+        // Strip the negative synthetic sentinel — load() rebuilds the whole-class unit.
+        $secIds  = array_values(array_filter(array_map('intval', $raw), static fn($i) => $i > 0));
+        $yearId  = (int)Yii::$app->request->get('academic_year_id', 0);
+        try {
+            return (new \app\components\ai\timetable\TimetableDataLoader())
+                ->loadClassAllocation($this->campusId(), $classId, $yearId, $secIds);
+        } catch (\Throwable $e) {
+            return ['ok' => false, 'message' => $e->getMessage(), 'sections' => []];
+        }
     }
 
     /** Run the AI generation pipeline (AJAX). */
@@ -105,17 +137,25 @@ class TimetableComposerController extends Controller
         if ($classId <= 0 || $yearId <= 0) {
             return ['ok' => false, 'message' => 'Pick a class and academic year first.'];
         }
-        $sectionIds = array_map('intval', (array)($post['section_ids'] ?? []));
+        if (!StudentClass::find()->where(['id' => $classId, 'campus_id' => $this->campusId(), 'status' => 1])->exists()) {
+            return ['ok' => false, 'message' => 'Class not found.'];
+        }
+        // Keep only real section ids; the negative whole-class sentinel means
+        // "no specific sections" → solve the whole class in one pass.
+        $sectionIds = array_values(array_filter(
+            array_map('intval', (array)($post['section_ids'] ?? [])),
+            static fn($i) => $i > 0
+        ));
         $rules      = trim((string)($post['rules'] ?? ''));
 
         try {
             /** @var TimetableComposer $composer */
             $composer = Yii::createObject(TimetableComposer::class);
-            $out = $composer->generate(
-                $this->campusId(), $classId, $yearId, $sectionIds, $rules,
-                (int)Yii::$app->user->id
-            );
-            return ['ok' => $out['status'] !== TimetableGenerationRun::STATUS_FAILED] + $out;
+            $userId   = (int)Yii::$app->user->id;
+            $out = $sectionIds === []
+                ? $composer->generateClass($this->campusId(), $classId, $yearId, $rules, $userId)
+                : $composer->generate($this->campusId(), $classId, $yearId, $sectionIds, $rules, $userId);
+            return ['ok' => ($out['status'] ?? '') !== TimetableGenerationRun::STATUS_FAILED] + $out;
         } catch (\Throwable $e) {
             Yii::error('Timetable generate failed: ' . $e->getMessage(), 'ai');
             return ['ok' => false, 'message' => $e->getMessage()];

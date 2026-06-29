@@ -318,6 +318,159 @@ class SolverFixtures
         ];
     }
 
+    // ── Single-class fixtures (intake flow + distinct-per-section proofs) ──────
+
+    private static function clk(int $min): string
+    {
+        return sprintf('%02d:%02d', intdiv($min, 60) % 24, $min % 60);
+    }
+
+    /** Compact teaching grid: assembly + N periods, lunch after the middle period. */
+    private static function gridLayout(int $nPeriods): array
+    {
+        $rows = [['kind' => 'assembly', 'label' => 'Assembly', 'time_from' => '08:00', 'time_to' => '08:15']];
+        $lunchAfter = (int)floor($nPeriods / 2);
+        $clock = 8 * 60 + 15;
+        for ($p = 1; $p <= $nPeriods; $p++) {
+            $from = self::clk($clock);
+            $clock += 45;
+            $rows[] = ['kind' => 'period', 'no' => $p, 'time_from' => $from, 'time_to' => self::clk($clock)];
+            if ($p === $lunchAfter) {
+                $f = self::clk($clock);
+                $clock += 40;
+                $rows[] = ['kind' => 'lunch', 'label' => 'Lunch', 'time_from' => $f, 'time_to' => self::clk($clock)];
+            }
+        }
+        return $rows;
+    }
+
+    private static function teacher(int $id, string $name): array
+    {
+        return ['id' => $id, 'name' => $name, 'morning_only' => false,
+            'max_per_day' => 8, 'max_per_week' => 44, 'unavailable' => []];
+    }
+
+    /**
+     * CLONE-RISK: one class, two sections (7A/7B) with IDENTICAL subjects but
+     * fully-DISJOINT teacher pools per section — so no shared teacher forces the
+     * grids apart. With a fixed seed and NO cross-section diversity term the two
+     * grids could come out byte-identical. Proves the W_SECTION_DIVERSITY fix
+     * (test `each_section_grid_is_distinct`). 5 subjects × 6/wk = 30 = full grid.
+     */
+    public static function cloneRiskInput(): array
+    {
+        $teachers = [];
+        for ($i = 1; $i <= 20; $i++) {
+            $teachers[] = self::teacher($i, 'T' . $i);
+        }
+        $names = ['Mathematics', 'English', 'Science', 'Social', 'Hindi'];
+        $mkSubs = static function (array $pools) use ($names): array {
+            $out = [];
+            foreach ($names as $k => $nm) {
+                $out[] = ['id' => $k + 1, 'sgs_id' => 900 + $k, 'name' => $nm,
+                    'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false,
+                    'teacher_ids' => $pools[$k]];
+            }
+            return $out;
+        };
+        $aPools = [[1, 2], [3, 4], [5, 6], [7, 8], [9, 10]];
+        $bPools = [[11, 12], [13, 14], [15, 16], [17, 18], [19, 20]];
+        return [
+            'days'     => [1, 2, 3, 4, 5],
+            'layout'   => self::gridLayout(6),
+            'sections' => [
+                ['id' => 71, 'name' => '7A', 'subjects' => $mkSubs($aPools)],
+                ['id' => 72, 'name' => '7B', 'subjects' => $mkSubs($bPools)],
+            ],
+            'subjects' => $mkSubs($aPools), // union fallback
+            'teachers' => $teachers,
+        ];
+    }
+
+    /**
+     * TRIPLE-SECTION shared teacher: one class, sections 8A/8B/8C, Mathematics
+     * owned by a SINGLE shared teacher (id 1) across all three — the within-class
+     * "Mr. Kishore" case. Filler subjects have 3-teacher pools so each section
+     * gets its own teacher for them. Proves the shared Maths teacher is placed at
+     * different (day,period) slots in every section (no double-booking).
+     */
+    public static function tripleSectionInput(): array
+    {
+        $teachers = [];
+        for ($i = 1; $i <= 13; $i++) {
+            $teachers[] = self::teacher($i, 'T' . $i);
+        }
+        $subjects = [
+            ['id' => 1, 'sgs_id' => 801, 'name' => 'Mathematics', 'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [1]],
+            ['id' => 2, 'sgs_id' => 802, 'name' => 'English',     'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [2, 3, 4]],
+            ['id' => 3, 'sgs_id' => 803, 'name' => 'Science',     'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [5, 6, 7]],
+            ['id' => 4, 'sgs_id' => 804, 'name' => 'Social',      'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [8, 9, 10]],
+            ['id' => 5, 'sgs_id' => 805, 'name' => 'Hindi',       'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [11, 12, 13]],
+        ];
+        return [
+            'days'     => [1, 2, 3, 4, 5],
+            'layout'   => self::gridLayout(6),
+            'sections' => [
+                ['id' => 81, 'name' => '8A'],
+                ['id' => 82, 'name' => '8B'],
+                ['id' => 83, 'name' => '8C'],
+            ],
+            'subjects' => $subjects,
+            'teachers' => $teachers,
+        ];
+    }
+
+    /**
+     * NO-SECTION small school: a class with no class_sections rows is treated as
+     * ONE synthetic whole-class unit (negative id). Proves the monolithic-class
+     * path solves to a single valid timetable. 5 subjects × 6/wk = 30 = full grid.
+     */
+    public static function noSectionInput(): array
+    {
+        $teachers = [];
+        for ($i = 1; $i <= 8; $i++) {
+            $teachers[] = self::teacher($i, 'T' . $i);
+        }
+        $subjects = [
+            ['id' => 1, 'sgs_id' => 701, 'name' => 'Mathematics', 'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [1, 2]],
+            ['id' => 2, 'sgs_id' => 702, 'name' => 'English',     'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [3, 4]],
+            ['id' => 3, 'sgs_id' => 703, 'name' => 'Science',     'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [5, 6]],
+            ['id' => 4, 'sgs_id' => 704, 'name' => 'Social',      'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [7]],
+            ['id' => 5, 'sgs_id' => 705, 'name' => 'Hindi',       'per_week' => 6, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [8]],
+        ];
+        return [
+            'days'     => [1, 2, 3, 4, 5],
+            'layout'   => self::gridLayout(6),
+            'sections' => [
+                ['id' => -9, 'name' => '(Whole class)', 'synthetic' => true, 'subjects' => $subjects],
+            ],
+            'subjects' => $subjects,
+            'teachers' => $teachers,
+        ];
+    }
+
+    /**
+     * MINIMAL universal school: the smallest valid universe the loader can emit —
+     * 1 class, 1 section, 2 subjects, 2 teachers, 3 days, 2 periods/day. Proves
+     * the engine accepts any minimal data-contract-conformant input.
+     */
+    public static function minimalSchoolInput(): array
+    {
+        $subjects = [
+            ['id' => 1, 'sgs_id' => 601, 'name' => 'Mathematics', 'per_week' => 3, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [1]],
+            ['id' => 2, 'sgs_id' => 602, 'name' => 'English',     'per_week' => 3, 'max_per_day' => 2, 'after_lunch_only' => false, 'teacher_ids' => [2]],
+        ];
+        return [
+            'days'     => [1, 2, 3],
+            'layout'   => self::gridLayout(2),
+            'sections' => [
+                ['id' => 1, 'name' => 'A', 'subjects' => $subjects],
+            ],
+            'subjects' => $subjects,
+            'teachers' => [self::teacher(1, 'T1'), self::teacher(2, 'T2')],
+        ];
+    }
+
     /** 8 academic periods, lunch after P5 (afternoon = P6–P8). */
     private static function wholeSchoolLayout(): array
     {

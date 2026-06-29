@@ -64,6 +64,11 @@ class TimetableSolver
     public const W_BACK_TO_BACK = 55;
     public const W_LOAD_BALANCE = 20;
     public const W_JITTER       = 3;
+    /** Cross-section diversity: nudge sibling sections to fan a shared subject
+     *  across different (day,period) cells so two sections never come out
+     *  byte-identical. Small — only breaks otherwise-equal ties; never overrides
+     *  anti-column / back-to-back / day-spread and never touches a HARD constraint. */
+    public const W_SECTION_DIVERSITY = 8;
 
     /**
      * Solve a weekly timetable for all sections at once.
@@ -167,6 +172,7 @@ class TimetableSolver
         $teacherWeek = []; // [tid]                => count
         $subjDay     = []; // [secId][subId][day]  => count
         $subjCol     = []; // [secId][subId][per]  => count (anti-column)
+        $globalCol   = []; // [subId][day][per]    => count across ALL sections (cross-section diversity)
         $lock        = []; // [secId][subId]       => tid (teacher consistency)
         $lockCount   = []; // [secId][subId]       => placed periods under the lock
 
@@ -206,12 +212,12 @@ class TimetableSolver
 
         foreach ($items as $item) {
             $placed = self::place($item['sec'], $item['sub'], $days, $periods, $teachers,
-                $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots, $jitter);
+                $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots, $jitter);
 
             if (!$placed) {
                 // Single-depth eviction: move an existing slot elsewhere to free a cell.
                 $placed = self::evictAndPlace($item['sec'], $item['sub'], $days, $periods, $teachers,
-                    $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots, $jitter);
+                    $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots, $jitter);
             }
             if (!$placed) {
                 $unplaced[] = ['section_id' => $item['sec']['id'], 'subject' => $item['sub']['name']];
@@ -258,7 +264,7 @@ class TimetableSolver
     private static function place(
         array $sec, array $sub, array $days, array $periods, array $teachers,
         array &$grid, array &$teacherBusy, array &$teacherDay, array &$teacherWeek,
-        array &$subjDay, array &$subjCol, array &$lock, array &$lockCount, array &$slots, bool $jitter
+        array &$subjDay, array &$subjCol, array &$globalCol, array &$lock, array &$lockCount, array &$slots, bool $jitter
     ): bool {
         $bestKey = null;
         $bestCost = PHP_INT_MAX;
@@ -292,6 +298,9 @@ class TimetableSolver
                     $cost += self::W_BACK_TO_BACK;
                 }
                 $cost += self::W_LOAD_BALANCE * (int)(($teacherWeek[$tid] ?? 0) / 5);
+                // Cross-section diversity: penalise reusing a (day,period) another
+                // section already gave this subject, so sibling grids diverge.
+                $cost += self::W_SECTION_DIVERSITY * ($globalCol[$sub['id']][$day][$pNo] ?? 0);
                 if ($jitter) {
                     $cost += mt_rand(0, self::W_JITTER);
                 }
@@ -309,7 +318,7 @@ class TimetableSolver
         }
         [$day, $pNo] = $bestKey;
         self::commit($sec, $sub, $bestTid, $day, $pNo, $periods[$pNo],
-            $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots);
+            $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots);
         return true;
     }
 
@@ -317,7 +326,7 @@ class TimetableSolver
     private static function evictAndPlace(
         array $sec, array $sub, array $days, array $periods, array $teachers,
         array &$grid, array &$teacherBusy, array &$teacherDay, array &$teacherWeek,
-        array &$subjDay, array &$subjCol, array &$lock, array &$lockCount, array &$slots, bool $jitter
+        array &$subjDay, array &$subjCol, array &$globalCol, array &$lock, array &$lockCount, array &$slots, bool $jitter
     ): bool {
         $tries = 0;
         foreach ($days as $day) {
@@ -336,27 +345,27 @@ class TimetableSolver
                     continue;
                 }
                 // Would WE have a teacher here once the victim leaves?
-                self::uncommit($victim, $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots);
+                self::uncommit($victim, $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots);
                 $tid = self::freeTeacher($sec, $sub, $teachers, $day, $pNo, $p,
                     $teacherBusy, $teacherDay, $teacherWeek, $lock);
                 if ($tid === null) {
-                    self::recommit($victim, $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots);
+                    self::recommit($victim, $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots);
                     continue;
                 }
                 // Place us, then try to re-home the victim somewhere else.
                 self::commit($sec, $sub, $tid, $day, $pNo, $p,
-                    $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots);
+                    $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots);
 
                 $victimSub = $victim['_sub'];
                 $rehomed = self::place($sec, $victimSub, $days, $periods, $teachers,
-                    $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots, $jitter);
+                    $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots, $jitter);
                 if ($rehomed) {
                     return true;
                 }
                 // Undo everything: remove us, restore victim.
                 $ours = end($slots);
-                self::uncommit($ours, $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots);
-                self::recommit($victim, $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $lock, $lockCount, $slots);
+                self::uncommit($ours, $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots);
+                self::recommit($victim, $grid, $teacherBusy, $teacherDay, $teacherWeek, $subjDay, $subjCol, $globalCol, $lock, $lockCount, $slots);
             }
         }
         return false;
@@ -414,7 +423,7 @@ class TimetableSolver
     private static function commit(
         array $sec, array $sub, int $tid, int $day, int $pNo, array $p,
         array &$grid, array &$teacherBusy, array &$teacherDay, array &$teacherWeek,
-        array &$subjDay, array &$subjCol, array &$lock, array &$lockCount, array &$slots
+        array &$subjDay, array &$subjCol, array &$globalCol, array &$lock, array &$lockCount, array &$slots
     ): void {
         $slot = [
             'section_id'   => $sec['id'],
@@ -435,6 +444,7 @@ class TimetableSolver
         $teacherWeek[$tid] = ($teacherWeek[$tid] ?? 0) + 1;
         $subjDay[$sec['id']][$sub['id']][$day] = ($subjDay[$sec['id']][$sub['id']][$day] ?? 0) + 1;
         $subjCol[$sec['id']][$sub['id']][$pNo] = ($subjCol[$sec['id']][$sub['id']][$pNo] ?? 0) + 1;
+        $globalCol[$sub['id']][$day][$pNo] = ($globalCol[$sub['id']][$day][$pNo] ?? 0) + 1;
 
         // Teacher consistency: first placement owns the (section, subject).
         if (!isset($lock[$sec['id']][$sub['id']])) {
@@ -451,7 +461,7 @@ class TimetableSolver
     private static function uncommit(
         array $slot,
         array &$grid, array &$teacherBusy, array &$teacherDay, array &$teacherWeek,
-        array &$subjDay, array &$subjCol, array &$lock, array &$lockCount, array &$slots
+        array &$subjDay, array &$subjCol, array &$globalCol, array &$lock, array &$lockCount, array &$slots
     ): void {
         unset($grid[$slot['section_id']][$slot['day']][$slot['period']]);
         unset($teacherBusy[$slot['teacher_id']][$slot['day']][$slot['period']]);
@@ -459,6 +469,9 @@ class TimetableSolver
         $teacherWeek[$slot['teacher_id']]--;
         $subjDay[$slot['section_id']][$slot['subject_id']][$slot['day']]--;
         $subjCol[$slot['section_id']][$slot['subject_id']][$slot['period']]--;
+        if (isset($globalCol[$slot['subject_id']][$slot['day']][$slot['period']])) {
+            $globalCol[$slot['subject_id']][$slot['day']][$slot['period']]--;
+        }
 
         // Release the ownership lock when the last placed period is removed
         // (external teacher_map locks are permanent: count = PHP_INT_MAX).
@@ -482,7 +495,7 @@ class TimetableSolver
     private static function recommit(
         array $slot,
         array &$grid, array &$teacherBusy, array &$teacherDay, array &$teacherWeek,
-        array &$subjDay, array &$subjCol, array &$lock, array &$lockCount, array &$slots
+        array &$subjDay, array &$subjCol, array &$globalCol, array &$lock, array &$lockCount, array &$slots
     ): void {
         $grid[$slot['section_id']][$slot['day']][$slot['period']] = $slot;
         $teacherBusy[$slot['teacher_id']][$slot['day']][$slot['period']] = true;
@@ -490,6 +503,7 @@ class TimetableSolver
         $teacherWeek[$slot['teacher_id']] = ($teacherWeek[$slot['teacher_id']] ?? 0) + 1;
         $subjDay[$slot['section_id']][$slot['subject_id']][$slot['day']] = ($subjDay[$slot['section_id']][$slot['subject_id']][$slot['day']] ?? 0) + 1;
         $subjCol[$slot['section_id']][$slot['subject_id']][$slot['period']] = ($subjCol[$slot['section_id']][$slot['subject_id']][$slot['period']] ?? 0) + 1;
+        $globalCol[$slot['subject_id']][$slot['day']][$slot['period']] = ($globalCol[$slot['subject_id']][$slot['day']][$slot['period']] ?? 0) + 1;
 
         if (!isset($lock[$slot['section_id']][$slot['subject_id']])) {
             $lock[$slot['section_id']][$slot['subject_id']]      = $slot['teacher_id'];

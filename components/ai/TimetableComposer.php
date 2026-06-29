@@ -38,8 +38,37 @@ class TimetableComposer extends Component
     public function generate(int $campusId, int $classId, int $academicYearId,
                              array $sectionIds, string $rulesText, ?int $userId): array
     {
+        // Guard: a requested subset must actually belong to this class.
+        if ($sectionIds !== []) {
+            $belong = (new Query())->select('id')->from('class_sections')
+                ->where(['id' => $sectionIds, 'student_class_id' => $classId,
+                         'campus_id' => $campusId, 'status' => 1])
+                ->column();
+            if (count(array_unique(array_map('intval', $sectionIds))) !== count($belong)) {
+                // Throw (not a custom array) so callers get one consistent error
+                // shape — the controller's try/catch returns {ok:false,message}.
+                throw new \InvalidArgumentException('Some selected sections do not belong to this class.');
+            }
+        }
+
         $loader = new TimetableDataLoader();
         $loaded = $loader->load($campusId, $classId, $academicYearId, $sectionIds);
+        return $this->runPipeline($campusId, $classId, $academicYearId, $rulesText, $loaded, $userId);
+    }
+
+    /**
+     * Single-class generation: solve ALL active sections of ONE class in ONE
+     * solve, so within-class cross-section no-overlap is guaranteed by the engine
+     * (a teacher who takes the same subject in 6A/6B/6C is never double-booked).
+     * For a class with no sections the loader yields one synthetic whole-class
+     * unit, and this still produces a valid single timetable. Sibling of
+     * generateSchool(); use generate() for a chosen subset of sections.
+     */
+    public function generateClass(int $campusId, int $classId, int $academicYearId,
+                                  string $rulesText, ?int $userId): array
+    {
+        $loader = new TimetableDataLoader();
+        $loaded = $loader->load($campusId, $classId, $academicYearId, []); // [] = all sections
         return $this->runPipeline($campusId, $classId, $academicYearId, $rulesText, $loaded, $userId);
     }
 
@@ -151,14 +180,42 @@ class TimetableComposer extends Component
         }
 
         return [
-            'run_id'      => (int)$run->id,
-            'status'      => $run->status,
-            'stats'       => $result['stats'],
-            'warnings'    => $loaded['warnings'],
-            'source'      => $constraints['_source'] ?? 'none',
-            'narrative'   => $narrative,
-            'feasibility' => $feasibility,
+            'run_id'            => (int)$run->id,
+            'status'            => $run->status,
+            'stats'             => $result['stats'],
+            'warnings'          => $loaded['warnings'],
+            'source'            => $constraints['_source'] ?? 'none',
+            'narrative'         => $narrative,
+            'feasibility'       => $feasibility,
+            // Read-only proof for the UI: no two sections came out identical.
+            'distinct_sections' => self::sectionsAreDistinct($result['slots']),
         ];
+    }
+
+    /**
+     * True if every section's {day,period => subject_id} signature is unique —
+     * i.e. no two sections came out byte-identical. Pure, read-only; a single
+     * section trivially passes. Surfaced in the UI and asserted in tests.
+     */
+    public static function sectionsAreDistinct(array $slots): bool
+    {
+        $sig = [];
+        foreach ($slots as $s) {
+            if (!isset($s['subject_id'])) {
+                continue;
+            }
+            $sig[$s['section_id']][$s['day'] . ':' . $s['period']] = $s['subject_id'];
+        }
+        $seen = [];
+        foreach ($sig as $cells) {
+            ksort($cells);
+            $h = md5(json_encode($cells));
+            if (isset($seen[$h])) {
+                return false;
+            }
+            $seen[$h] = true;
+        }
+        return true;
     }
 
     /**
@@ -197,30 +254,52 @@ class TimetableComposer extends Component
         }
 
         $sectionIds = $run->sectionIdList();
-        $roomId     = $this->resolveRoomId($run->campus_id, $run->class_id, $sectionIds);
-        $now        = date('Y-m-d H:i:s');
+        // A no-section class is generated as ONE synthetic whole-class unit with a
+        // NEGATIVE section id (-classId). It must never reach subject_timetable as a
+        // negative id — the live convention for a monolithic class is section_id 0
+        // (the same sentinel generateSchool uses for class_id). Split real vs synthetic.
+        $realSectionIds = array_values(array_filter(array_map('intval', $sectionIds), static fn($i) => $i > 0));
+        $hasSynthetic   = count($realSectionIds) !== count($sectionIds);
+        $roomId         = $this->resolveRoomId($run->campus_id, $run->class_id, $realSectionIds);
+        $now            = date('Y-m-d H:i:s');
 
-        // Resolve class per section so each row is written to its own class —
+        // Resolve class per REAL section so each row is written to its own class —
         // correct for a single class AND a whole-school run (class_id sentinel 0).
-        // section_id uniquely determines its class, so we archive/insert by
-        // section regardless of the run's class_id.
-        $sectionClass = (new Query())->select(['student_class_id'])
-            ->from('class_sections')->where(['id' => $sectionIds])->indexBy('id')->column();
+        $sectionClass = $realSectionIds === [] ? [] : (new Query())->select(['student_class_id'])
+            ->from('class_sections')->where(['id' => $realSectionIds])->indexBy('id')->column();
 
         $tx = Yii::$app->db->beginTransaction();
         try {
             // Archive (soft-delete) the current timetable for exactly these
             // sections (campus + year scoped; section_id encodes the class).
-            $archived = Yii::$app->db->createCommand()->update(
-                'subject_timetable',
-                ['status' => SubjectTimetable::STATUS_DELETE, 'updated_on' => $now, 'update_user_id' => $userId],
-                [
-                    'campus_id'        => $run->campus_id,
-                    'academic_year_id' => $run->academic_year_id,
-                    'section_id'       => $sectionIds,
-                    'status'           => SubjectTimetable::STATUS_ACTIVE,
-                ]
-            )->execute();
+            $archived = 0;
+            if ($realSectionIds !== []) {
+                $archived += Yii::$app->db->createCommand()->update(
+                    'subject_timetable',
+                    ['status' => SubjectTimetable::STATUS_DELETE, 'updated_on' => $now, 'update_user_id' => $userId],
+                    [
+                        'campus_id'        => $run->campus_id,
+                        'academic_year_id' => $run->academic_year_id,
+                        'section_id'       => $realSectionIds,
+                        'status'           => SubjectTimetable::STATUS_ACTIVE,
+                    ]
+                )->execute();
+            }
+            if ($hasSynthetic) {
+                // Whole-class (no sections): archive this class's monolithic rows
+                // (section_id = 0), scoped BY CLASS so other classes are untouched.
+                $archived += Yii::$app->db->createCommand()->update(
+                    'subject_timetable',
+                    ['status' => SubjectTimetable::STATUS_DELETE, 'updated_on' => $now, 'update_user_id' => $userId],
+                    [
+                        'campus_id'        => $run->campus_id,
+                        'academic_year_id' => $run->academic_year_id,
+                        'class_id'         => $run->class_id,
+                        'section_id'       => 0,
+                        'status'           => SubjectTimetable::STATUS_ACTIVE,
+                    ]
+                )->execute();
+            }
 
             // Insert the generated week. Bulk insert mirrors the manual flow's
             // columns; the whole run was validated atomically above, so the
@@ -232,8 +311,12 @@ class TimetableComposer extends Component
             $dayFormat = \app\components\ai\timetable\DayId::detectFormat($run->campus_id);
             $rows = [];
             foreach ($slots as $s) {
-                $secId = (int)$s['section_id'];
-                $rowClassId = (int)($sectionClass[$secId] ?? $run->class_id); // per-section class
+                $draftSecId = (int)$s['section_id'];
+                // synthetic whole-class unit (-classId) → live section_id 0
+                $secId      = $draftSecId > 0 ? $draftSecId : 0;
+                $rowClassId = $draftSecId > 0
+                    ? (int)($sectionClass[$draftSecId] ?? $run->class_id) // per-section class
+                    : (int)$run->class_id;                                // monolithic class
                 $rows[] = [
                     $run->campus_id,
                     \app\components\ai\timetable\DayId::forCampus((int)$s['day_id'], $dayFormat),

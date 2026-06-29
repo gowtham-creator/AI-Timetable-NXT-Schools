@@ -401,7 +401,7 @@ $h = static fn($v) => htmlspecialchars((string)$v, ENT_QUOTES);
 <body>
 <header>
     <h1>NXT School ERP — AI Timetable Studio <span style="opacity:.7;font-weight:400">· live engine demo</span></h1>
-    <p>Every grid below is produced by the actual pluggable engine (<code>components/ai/timetable/</code>) — no database, no API key. Coordinator · Teacher · Substitute, just like production.</p>
+    <p>Every grid below is produced by the actual pluggable engine (<code>components/ai/timetable/</code>) — no database, no API key. Coordinator · Teacher · Substitute, just like production. · <a href="class.php" style="color:#cfe0ff">single-class studio →</a> · <a href="school.php" style="color:#cfe0ff">whole-school →</a> · <a href="logs.php" style="color:#cfe0ff">AI logs →</a></p>
 </header>
 <main>
 

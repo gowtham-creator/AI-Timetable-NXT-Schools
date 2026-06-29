@@ -296,7 +296,7 @@ foreach ($input['sections'] as $s) $classes[$s['class']][] = $s;
 <body>
 <header>
     <h1>NXT School ERP — Whole-School Timetable &amp; Teacher Allocation</h1>
-    <p>Classes 6–10 generated in ONE run on the real engine. A teacher who teaches across classes is allocated per section, balanced, and never double-booked. · <a href="index.php">← single-class studio</a></p>
+    <p>Classes 6–10 generated in ONE run on the real engine. A teacher who teaches across classes is allocated per section, balanced, and never double-booked. · <a href="index.php">← coordinator studio</a> · <a href="class.php">single class →</a> · <a href="logs.php">AI logs →</a></p>
 </header>
 <main>
     <form class="card" method="get">
